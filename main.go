@@ -36,7 +36,7 @@ var roomsMutex sync.Mutex
 
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
-	http.Handle("/", http.FileServer(http.Dir("./client")))
+	http.Handle("/", http.FileServer(http.Dir("./client/browser")))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
