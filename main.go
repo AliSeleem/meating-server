@@ -32,8 +32,8 @@ type Room struct {
 
 type Message struct {
 	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
-	Room    string          `json:"room"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+	Room    string          `json:"room,omitempty"`
 	From    string          `json:"from,omitempty"`
 	Target  string          `json:"target,omitempty"`
 	Name    string          `json:"name,omitempty"`
@@ -49,7 +49,7 @@ var (
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
 	http.Handle("/", http.FileServer(http.Dir("./client/browser")))
-	log.Println("Server started on :8080")
+	log.Println("✅ Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -76,14 +76,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		case "join":
 			client.handleJoin(msg)
 		case "offer", "answer", "ice-candidate":
-			if client.room != nil {
-				client.room.forwardToTarget(msg.Target, Message{
-					Type:    msg.Type,
-					Payload: msg.Payload,
-					From:    client.id,
-					Name:    client.name,
-				})
-			}
+			client.forwardToTarget(msg)
 		case "leave":
 			client.leaveRoom()
 		}
@@ -95,11 +88,14 @@ func (c *Client) handleJoin(msg Message) {
 		Name string `json:"name"`
 	}
 	json.Unmarshal(msg.Payload, &joinData)
-
 	c.name = joinData.Name
 	c.id = c.name + "_" + time.Now().Format("150405")
 
 	room := getOrCreateRoom(msg.Room)
+	if room == nil {
+		c.sendMessage(Message{Type: "error", Payload: []byte(`"Max rooms limit reached"`)})
+		return
+	}
 	c.room = room
 
 	room.mutex.Lock()
@@ -113,29 +109,26 @@ func (c *Client) handleJoin(msg Message) {
 	room.clients[c] = true
 	log.Printf("%s joined room %s", c.id, msg.Room)
 
-	// Send list of existing participants to the new client
-	var participants []string
+	// send list of participants to new user
+	var participants []map[string]string
 	for cl := range room.clients {
 		if cl != c {
-			participants = append(participants, cl.id)
+			participants = append(participants, map[string]string{
+				"id":   cl.id,
+				"name": cl.name,
+			})
 		}
 	}
-	participantsJSON, _ := json.Marshal(participants)
-	c.sendMessage(Message{Type: "participants", Payload: participantsJSON})
+	listJSON, _ := json.Marshal(participants)
+	c.sendMessage(Message{Type: "participants", Payload: listJSON})
 
-	// Notify others that this client joined
-	room.broadcast(c, Message{
-		Type: "user-joined",
-		From: c.id,
-		Name: c.name,
-	})
+	// notify others
+	room.broadcast(c, Message{Type: "user-joined", From: c.id, Name: c.name})
 }
 
 func (c *Client) writeMessages() {
 	for msg := range c.send {
-		err := c.conn.WriteMessage(websocket.TextMessage, msg)
-		if err != nil {
-			log.Println("Write error:", err)
+		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 			c.leaveRoom()
 			return
 		}
@@ -147,24 +140,37 @@ func (c *Client) sendMessage(msg Message) {
 	c.send <- data
 }
 
+func (c *Client) forwardToTarget(msg Message) {
+	if c.room == nil {
+		return
+	}
+	c.room.mutex.Lock()
+	defer c.room.mutex.Unlock()
+	for client := range c.room.clients {
+		if client.id == msg.Target {
+			msg.From = c.id
+			data, _ := json.Marshal(msg)
+			client.send <- data
+			break
+		}
+	}
+}
+
 func (c *Client) leaveRoom() {
 	if c.room == nil {
 		return
 	}
 	room := c.room
-
 	room.mutex.Lock()
 	if _, exists := room.clients[c]; exists {
 		delete(room.clients, c)
 		close(c.send)
-		log.Printf("%s left room %s", c.id, room.id)
 		room.broadcast(c, Message{Type: "user-left", From: c.id})
 	}
 	room.mutex.Unlock()
-
 	c.conn.Close()
 
-	// Delete empty room
+	// delete empty room
 	if len(room.clients) == 0 {
 		roomsMutex.Lock()
 		delete(rooms, room.id)
@@ -173,43 +179,25 @@ func (c *Client) leaveRoom() {
 	}
 }
 
-func getOrCreateRoom(roomID string) *Room {
-	roomsMutex.Lock()
-	defer roomsMutex.Unlock()
-
-	if room, exists := rooms[roomID]; exists {
-		return room
-	}
-
-	if len(rooms) >= maxRooms {
-		return nil
-	}
-
-	room := &Room{id: roomID, clients: make(map[*Client]bool)}
-	rooms[roomID] = room
-	return room
-}
-
 func (r *Room) broadcast(sender *Client, msg Message) {
 	data, _ := json.Marshal(msg)
 	for client := range r.clients {
 		if client != sender {
-			select {
-			case client.send <- data:
-			default:
-				close(client.send)
-				delete(r.clients, client)
-			}
+			client.send <- data
 		}
 	}
 }
 
-func (r *Room) forwardToTarget(target string, msg Message) {
-	data, _ := json.Marshal(msg)
-	for client := range r.clients {
-		if client.id == target {
-			client.send <- data
-			return
-		}
+func getOrCreateRoom(id string) *Room {
+	roomsMutex.Lock()
+	defer roomsMutex.Unlock()
+	if room, ok := rooms[id]; ok {
+		return room
 	}
+	if len(rooms) >= maxRooms {
+		return nil
+	}
+	room := &Room{id: id, clients: make(map[*Client]bool)}
+	rooms[id] = room
+	return room
 }
