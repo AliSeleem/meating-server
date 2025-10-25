@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -11,18 +10,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const (
-	MaxUsersPerRoom = 4
-	MaxRooms        = 50
-)
-
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
-
-// ----------- DATA STRUCTURES -----------
 
 type Client struct {
 	id   string
@@ -34,7 +26,7 @@ type Client struct {
 
 type Room struct {
 	id      string
-	clients map[string]*Client
+	clients map[*Client]bool
 	mutex   sync.Mutex
 }
 
@@ -42,85 +34,110 @@ type Message struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload"`
 	Room    string          `json:"room"`
-	Target  string          `json:"target,omitempty"`
 	From    string          `json:"from,omitempty"`
+	Target  string          `json:"target,omitempty"`
 	Name    string          `json:"name,omitempty"`
 }
 
-// ----------- GLOBAL STATE -----------
-
-var rooms = make(map[string]*Room)
-var roomsMutex sync.Mutex
-
-// ----------- MAIN FUNCTION -----------
+var (
+	rooms      = make(map[string]*Room)
+	roomsMutex sync.Mutex
+	maxRooms   = 50
+	maxUsers   = 4
+)
 
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
 	http.Handle("/", http.FileServer(http.Dir("./client/browser")))
-	log.Println("🚀 Server started on http://localhost:8080")
+	log.Println("Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
-
-// ----------- HANDLERS -----------
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("❌ Upgrade error:", err)
+		log.Println("Upgrade error:", err)
 		return
 	}
-
-	client := &Client{
-		conn: conn,
-		send: make(chan []byte, 256),
-	}
+	client := &Client{conn: conn, send: make(chan []byte, 256)}
 
 	go client.writeMessages()
-	client.readMessages()
-}
-
-func (c *Client) readMessages() {
-	defer func() {
-		c.leaveRoom()
-		c.conn.Close()
-	}()
 
 	for {
 		var msg Message
-		err := c.conn.ReadJSON(&msg)
+		err := conn.ReadJSON(&msg)
 		if err != nil {
-			log.Println("❌ Read error:", err)
+			log.Println("Read error:", err)
+			client.leaveRoom()
 			break
 		}
 
 		switch msg.Type {
 		case "join":
-			c.name = msg.Name
-			clientID := fmt.Sprintf("%s_%d", msg.Name, time.Now().UnixNano())
-			c.id = clientID
-			c.joinRoom(msg.Room)
-
+			client.handleJoin(msg)
 		case "offer", "answer", "ice-candidate":
-			if c.room != nil {
-				c.room.forwardToTarget(msg.Target, Message{
+			if client.room != nil {
+				client.room.forwardToTarget(msg.Target, Message{
 					Type:    msg.Type,
 					Payload: msg.Payload,
-					From:    c.id,
-					Name:    c.name,
+					From:    client.id,
+					Name:    client.name,
 				})
 			}
+		case "leave":
+			client.leaveRoom()
 		}
 	}
 }
 
-// ----------- CLIENT METHODS -----------
+func (c *Client) handleJoin(msg Message) {
+	var joinData struct {
+		Name string `json:"name"`
+	}
+	json.Unmarshal(msg.Payload, &joinData)
+
+	c.name = joinData.Name
+	c.id = c.name + "_" + time.Now().Format("150405")
+
+	room := getOrCreateRoom(msg.Room)
+	c.room = room
+
+	room.mutex.Lock()
+	defer room.mutex.Unlock()
+
+	if len(room.clients) >= maxUsers {
+		c.sendMessage(Message{Type: "error", Payload: []byte(`"Room is full"`)})
+		return
+	}
+
+	room.clients[c] = true
+	log.Printf("%s joined room %s", c.id, msg.Room)
+
+	// Send list of existing participants to the new client
+	var participants []string
+	for cl := range room.clients {
+		if cl != c {
+			participants = append(participants, cl.id)
+		}
+	}
+	participantsJSON, _ := json.Marshal(participants)
+	c.sendMessage(Message{Type: "participants", Payload: participantsJSON})
+
+	// Notify others that this client joined
+	room.broadcast(c, Message{
+		Type: "user-joined",
+		From: c.id,
+		Name: c.name,
+	})
+}
 
 func (c *Client) writeMessages() {
 	for msg := range c.send {
 		err := c.conn.WriteMessage(websocket.TextMessage, msg)
 		if err != nil {
-			log.Println("❌ Write error:", err)
-			break
+			log.Println("Write error:", err)
+			c.leaveRoom()
+			return
 		}
 	}
 }
@@ -130,103 +147,69 @@ func (c *Client) sendMessage(msg Message) {
 	c.send <- data
 }
 
-func (c *Client) joinRoom(roomID string) {
-	room, err := getOrCreateRoom(roomID)
-	if err != nil {
-		c.sendError(err.Error())
-		c.conn.Close()
-		return
-	}
-
-	room.mutex.Lock()
-	defer room.mutex.Unlock()
-
-	if len(room.clients) >= MaxUsersPerRoom {
-		c.sendError("Room is full (max 4 users)")
-		c.conn.Close()
-		return
-	}
-
-	room.clients[c.id] = c
-	c.room = room
-
-	// Send back confirmation and own ID
-	c.sendMessage(Message{Type: "id", Payload: json.RawMessage(`"` + c.id + `"`)})
-	c.sendMessage(Message{Type: "joined", Name: c.name, From: c.id, Room: roomID})
-
-	// Notify others
-	room.broadcast(c.id, Message{Type: "user-joined", From: c.id, Name: c.name})
-	log.Printf("✅ %s joined room %s", c.name, roomID)
-}
-
 func (c *Client) leaveRoom() {
 	if c.room == nil {
 		return
 	}
+	room := c.room
 
-	c.room.mutex.Lock()
-	defer c.room.mutex.Unlock()
+	room.mutex.Lock()
+	if _, exists := room.clients[c]; exists {
+		delete(room.clients, c)
+		close(c.send)
+		log.Printf("%s left room %s", c.id, room.id)
+		room.broadcast(c, Message{Type: "user-left", From: c.id})
+	}
+	room.mutex.Unlock()
 
-	delete(c.room.clients, c.id)
-	c.room.broadcast(c.id, Message{Type: "user-left", From: c.id, Name: c.name})
-	log.Printf("👋 %s left room %s", c.name, c.room.id)
+	c.conn.Close()
 
-	// If room empty → delete it
-	if len(c.room.clients) == 0 {
-		deleteRoom(c.room.id)
+	// Delete empty room
+	if len(room.clients) == 0 {
+		roomsMutex.Lock()
+		delete(rooms, room.id)
+		roomsMutex.Unlock()
+		log.Println("Room", room.id, "deleted (empty)")
 	}
 }
 
-func (c *Client) sendError(message string) {
-	errMsg := Message{Type: "error", Payload: json.RawMessage(`"` + message + `"`) }
-	data, _ := json.Marshal(errMsg)
-	c.conn.WriteMessage(websocket.TextMessage, data)
-}
-
-// ----------- ROOM FUNCTIONS -----------
-
-func getOrCreateRoom(roomID string) (*Room, error) {
+func getOrCreateRoom(roomID string) *Room {
 	roomsMutex.Lock()
 	defer roomsMutex.Unlock()
 
-	if len(rooms) >= MaxRooms {
-		return nil, fmt.Errorf("Server reached maximum room capacity (50 rooms)")
+	if room, exists := rooms[roomID]; exists {
+		return room
 	}
 
-	room, exists := rooms[roomID]
-	if !exists {
-		room = &Room{
-			id:      roomID,
-			clients: make(map[string]*Client),
-		}
-		rooms[roomID] = room
-		log.Printf("🆕 Created room %s (total rooms: %d)", roomID, len(rooms))
+	if len(rooms) >= maxRooms {
+		return nil
 	}
 
-	return room, nil
+	room := &Room{id: roomID, clients: make(map[*Client]bool)}
+	rooms[roomID] = room
+	return room
 }
 
-func deleteRoom(roomID string) {
-	roomsMutex.Lock()
-	defer roomsMutex.Unlock()
-	delete(rooms, roomID)
-	log.Printf("🗑️ Deleted empty room %s", roomID)
-}
-
-func (r *Room) broadcast(senderID string, msg Message) {
+func (r *Room) broadcast(sender *Client, msg Message) {
 	data, _ := json.Marshal(msg)
-	for id, client := range r.clients {
-		if id != senderID {
-			client.send <- data
+	for client := range r.clients {
+		if client != sender {
+			select {
+			case client.send <- data:
+			default:
+				close(client.send)
+				delete(r.clients, client)
+			}
 		}
 	}
 }
 
-func (r *Room) forwardToTarget(targetID string, msg Message) {
-	r.mutex.Lock()
-	defer r.mutex.Unlock()
-	if targetClient, exists := r.clients[targetID]; exists {
-		data, _ := json.Marshal(msg)
-		targetClient.send <- data
+func (r *Room) forwardToTarget(target string, msg Message) {
+	data, _ := json.Marshal(msg)
+	for client := range r.clients {
+		if client.id == target {
+			client.send <- data
+			return
+		}
 	}
 }
