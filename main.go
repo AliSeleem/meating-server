@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -37,6 +36,7 @@ var roomsMutex sync.Mutex
 
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
+	http.Handle("/", http.FileServer(http.Dir("./client")))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -59,7 +59,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			client.leaveRoom()
 			break
 		}
-		fmt.Println(msg)
 
 		room := getOrCreateRoom(msg.Room)
 		room.mutex.Lock()
